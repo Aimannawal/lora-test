@@ -1,12 +1,16 @@
 # rx.py — LoRa Receiver + TCP Bridge (dengan AUTH) untuk GCS Flutter
 # Upload ke ESP receiver sebagai main.py
-# Butuh sx127x.py (versi baru) di ESP yang sama.
+# Butuh sx127x.py di ESP yang sama.
 #
 # Protokol TCP:
 #   1. GCS connect, lalu kirim baris pertama:  AUTH <token>\n
 #   2. Kalau token cocok, ESP kirim header CSV lalu forward tiap paket LoRa.
-#   3. Kalau salah / timeout, koneksi ditutup (klien sah tidak ikut tertendang).
+#   3. Kalau salah / timeout, koneksi ditutup.
 # Mendukung sampai MAX_CLIENTS GCS sekaligus (mis. laptop + Raspberry Pi).
+#
+# Format paket (14 field):
+# MISSION_TIME,PACKET_ID,TEAM_ID,PRESSURE,ALTITUDE,VOLTAGE,CURRENT,
+# STATE,LAT,LON,ROLL,PITCH,YAW,CHECKSUM
 
 from machine import Pin, SPI
 import time
@@ -15,8 +19,8 @@ import network
 from sx127x import SX127x
 
 # ===== KONFIGURASI WIFI =====
-WIFI_SSID     = "Nash"
-WIFI_PASSWORD = "123456789"
+WIFI_SSID     = "Iwin"
+WIFI_PASSWORD = "12345678"
 TCP_PORT      = 9999
 # ============================
 
@@ -30,16 +34,32 @@ MAX_CLIENTS     = 3
 PIN_SCK, PIN_MOSI, PIN_MISO = 18, 23, 19
 PIN_CS, PIN_RST = 5, 14
 FREQ = 433E6
-SPI_BAUD = 1000000     # 1 MHz: lebih tahan kabel jumper di breadboard
+SF = 9                 # HARUS sama dengan tx.py
+SPI_BAUD = 1000000
 SHOW_RSSI = True
 DEBUG = True           # cetak [dbg] tiap 2 detik; set False kalau sudah stabil
 # =====================================
 
-CSV_HEADER = (b"TEAM_ID,MISSION_TIME,PACKET_COUNT,ALTITUDE,PRESSURE,"
-              b"TEMPERATURE,VOLTAGE,ROLL,PITCH,YAW,GPS_LAT,GPS_LON,"
-              b"GPS_ALT,STATE\r\n")
+CSV_HEADER = (b"MISSION_TIME,PACKET_ID,TEAM_ID,PRESSURE,ALTITUDE,VOLTAGE,"
+              b"CURRENT,STATE,GPS_LAT,GPS_LON,ROLL,PITCH,YAW,CHECKSUM\r\n")
 
 AUTH_LINE = ("AUTH " + AUTH_TOKEN).encode()
+
+
+def checksum(s):
+    c = 0
+    for b in s.encode():
+        c ^= b
+    return "%02X" % c
+
+
+def valid_packet(line):
+    i = line.rfind(",")
+    if i < 0:
+        return False
+    if len(line.split(",")) != 14:
+        return False
+    return checksum(line[:i]) == line[i + 1:].strip().upper()
 
 
 def wifi_connect():
@@ -81,18 +101,20 @@ spi = SPI(1, baudrate=SPI_BAUD, polarity=0, phase=0,
 
 while True:
     try:
-        lora = SX127x(spi, cs=PIN_CS, rst=PIN_RST, freq=FREQ)
+        lora = SX127x(spi, cs=PIN_CS, rst=PIN_RST, freq=FREQ, sf=SF)
         break
     except Exception as e:
         print("[LoRa] init gagal:", e)
         time.sleep(1)
 lora.rx_start()
-print("[LoRa] Ready, freq", FREQ)
+print("[LoRa] Ready, freq", FREQ, "SF", SF)
 
 server = start_server(TCP_PORT)
 clients = []   # socket yang sudah lolos AUTH
 pending = []   # [sock, buf, t0, ip] menunggu AUTH
 rx_count = 0
+crc_err = 0
+bad_count = 0
 last_status = time.time()
 _dbg = time.ticks_ms()
 
@@ -140,7 +162,7 @@ def check_pending():
             pending.remove(p)
             first = buf.split(b"\n")[0].strip()
             if first == AUTH_LINE:
-                c.settimeout(1)                # send tidak boleh menggantung lama
+                c.settimeout(1)
                 try:
                     c.send(CSV_HEADER)
                 except OSError as e:
@@ -182,7 +204,7 @@ while True:
             print("[LoRa] CRC error #%d rssi=%d" % (crc_err, lora.rssi_now()))
     except Exception:
         pass
-    
+
     # -------- poll LoRa --------
     try:
         data = lora.poll()
@@ -197,7 +219,7 @@ while True:
             print("! <non-utf8>")
             line = None
 
-        if line is not None and len(line.split(",")) == 14:
+        if line is not None and valid_packet(line):
             rx_count += 1
             print("[LoRa] RX #%d: %s" % (rx_count, line))
             if SHOW_RSSI:
@@ -207,7 +229,8 @@ while True:
             else:
                 print("[TCP] Tidak ada GCS - paket tidak diteruskan")
         elif line is not None:
-            print("! Paket rusak:", line)
+            bad_count += 1
+            print("! Paket rusak / checksum salah:", line)
 
     # -------- status --------
     if not clients and time.time() - last_status > 5:
