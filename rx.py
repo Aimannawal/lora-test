@@ -1,21 +1,22 @@
 # rx.py — LoRa Receiver + TCP Bridge (dengan AUTH) untuk GCS Flutter
-# Upload ke ESP receiver sebagai main.py
-# Butuh sx127x.py di ESP yang sama.
+# Upload ke ESP receiver sebagai main.py (bersama sx127x.py).
 #
-# Protokol TCP:
+# Radio: paket binary 30 byte (lihat layout di tx.py).
+# TCP ke GCS tetap teks, jadi format lama tidak berubah:
 #   1. GCS connect, lalu kirim baris pertama:  AUTH <token>\n
-#   2. Kalau token cocok, ESP kirim header CSV lalu forward tiap paket LoRa.
+#   2. Kalau token cocok, ESP kirim header CSV lalu tiap paket LoRa sebagai
+#      CSV 14 field + checksum, diikuti satu baris  "#LINK <rssi> <snr>".
 #   3. Kalau salah / timeout, koneksi ditutup.
 # Mendukung sampai MAX_CLIENTS GCS sekaligus (mis. laptop + Raspberry Pi).
 #
-# Format paket (14 field):
-# MISSION_TIME,PACKET_ID,TEAM_ID,PRESSURE,ALTITUDE,VOLTAGE,CURRENT,
-# STATE,LAT,LON,ROLL,PITCH,YAW,CHECKSUM
+# CSV: MISSION_TIME,PACKET_ID,TEAM_ID,PRESSURE,ALTITUDE,VOLTAGE,CURRENT,
+#      STATE,LAT,LON,ROLL,PITCH,YAW,CHECKSUM
 
 from machine import Pin, SPI
 import time
 import socket
 import network
+import struct
 from sx127x import SX127x
 
 # ===== KONFIGURASI WIFI =====
@@ -30,15 +31,24 @@ AUTH_TIMEOUT_MS = 3000
 MAX_CLIENTS     = 3
 # ================
 
-# ===== SESUAIKAN PIN & FREKUENSI =====
+# ===== SESUAIKAN PIN & RADIO =====
 PIN_SCK, PIN_MOSI, PIN_MISO = 18, 23, 19
 PIN_CS, PIN_RST = 5, 14
 FREQ = 433E6
-SF = 9                 # HARUS sama dengan tx.py
+SF = 10                # HARUS sama dengan tx.py
+BW = 7                 # 7 = 125 kHz
+PREAMBLE = 12
 SPI_BAUD = 1000000
+EXPECT_TEAM = 8        # paket dengan team id lain dibuang (anti paket asing)
 SHOW_RSSI = True
 DEBUG = True           # cetak [dbg] tiap 2 detik; set False kalau sudah stabil
-# =====================================
+# =================================
+
+FMT = "<IHBHhHhBiihhh"
+SIZE = struct.calcsize(FMT)   # 30
+N_U16 = 0xFFFF
+N_I16 = -32768
+N_I32 = 0x7FFFFFFF
 
 CSV_HEADER = (b"MISSION_TIME,PACKET_ID,TEAM_ID,PRESSURE,ALTITUDE,VOLTAGE,"
               b"CURRENT,STATE,GPS_LAT,GPS_LON,ROLL,PITCH,YAW,CHECKSUM\r\n")
@@ -53,18 +63,41 @@ def checksum(s):
     return "%02X" % c
 
 
-def valid_packet(line):
-    i = line.rfind(",")
-    if i < 0:
-        return False
-    if len(line.split(",")) != 14:
-        return False
-    return checksum(line[:i]) == line[i + 1:].strip().upper()
+def fx(v, none, d):
+    """Integer berskala -> teks desimal tanpa float. none -> 'nan'."""
+    if v == none:
+        return "nan"
+    sign = "-" if v < 0 else ""
+    a = str(abs(v))
+    if len(a) <= d:
+        a = "0" * (d + 1 - len(a)) + a
+    return sign + a[:-d] + "." + a[-d:]
+
+
+def decode_packet(data):
+    """bytes (30) -> baris CSV 14 field + checksum, atau None kalau bukan paket kita."""
+    if len(data) != SIZE:
+        return None
+    (sec, pid, team, p, alt, volt, cur, st,
+     lat, lon, ro, pi, ya) = struct.unpack(FMT, data)
+    if team != EXPECT_TEAM:
+        return None
+    body = "%02d:%02d:%02d,%04d,%02d,%s,%s,%s,%s,%d,%s,%s,%s,%s,%s" % (
+        sec // 3600, (sec // 60) % 60, sec % 60, pid, team,
+        fx(p, N_U16, 1), fx(alt, N_I16, 1),
+        fx(volt, N_U16, 2), fx(cur, N_I16, 2), st,
+        fx(lat, N_I32, 5), fx(lon, N_I32, 5),
+        fx(ro, N_I16, 1), fx(pi, N_I16, 1), fx(ya, N_I16, 1))
+    return body + "," + checksum(body)
 
 
 def wifi_connect():
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
+    try:
+        wlan.config(pm=network.WLAN.PM_NONE)   # matikan WiFi power-save (latensi lebih rendah)
+    except Exception:
+        pass
     if not wlan.isconnected():
         print("[WiFi] Connecting to", WIFI_SSID)
         wlan.connect(WIFI_SSID, WIFI_PASSWORD)
@@ -77,9 +110,9 @@ def wifi_connect():
         ip = wlan.ifconfig()[0]
         print("[WiFi] IP Address :", ip)
         print("[GCS]  Set kReceiverHost di main.dart ke:", ip)
-        return ip
+        return wlan, ip
     print("[WiFi] GAGAL connect! Cek SSID/password.")
-    return None
+    return wlan, None
 
 
 def start_server(port):
@@ -91,8 +124,8 @@ def start_server(port):
     return s
 
 
-print("=== CanSat Ground Station - LoRa to TCP Bridge ===")
-ip = wifi_connect()
+print("=== CanSat Ground Station - LoRa to TCP Bridge (binary) ===")
+wlan, ip = wifi_connect()
 if ip is None:
     raise SystemExit("WiFi gagal - restart")
 
@@ -101,21 +134,23 @@ spi = SPI(1, baudrate=SPI_BAUD, polarity=0, phase=0,
 
 while True:
     try:
-        lora = SX127x(spi, cs=PIN_CS, rst=PIN_RST, freq=FREQ, sf=SF)
+        lora = SX127x(spi, cs=PIN_CS, rst=PIN_RST, freq=FREQ, sf=SF, bw=BW,
+                      preamble=PREAMBLE)
         break
     except Exception as e:
         print("[LoRa] init gagal:", e)
         time.sleep(1)
 lora.rx_start()
-print("[LoRa] Ready, freq", FREQ, "SF", SF)
+print("[LoRa] Ready, freq", FREQ, "SF", SF, "paket", SIZE, "byte")
 
 server = start_server(TCP_PORT)
 clients = []   # socket yang sudah lolos AUTH
 pending = []   # [sock, buf, t0, ip] menunggu AUTH
 rx_count = 0
-crc_err = 0
 bad_count = 0
+last_crc = 0
 last_status = time.time()
+last_wifi = time.time()
 _dbg = time.ticks_ms()
 
 print("Menunggu GCS connect ke", ip, ":", TCP_PORT)
@@ -162,7 +197,7 @@ def check_pending():
             pending.remove(p)
             first = buf.split(b"\n")[0].strip()
             if first == AUTH_LINE:
-                c.settimeout(1)
+                c.settimeout(0.5)
                 try:
                     c.send(CSV_HEADER)
                 except OSError as e:
@@ -182,8 +217,8 @@ def check_pending():
             safe_close(c)
 
 
-def forward(line):
-    payload = (line + "\r\n").encode()
+def forward(line, rssi, snr):
+    payload = (line + "\r\n#LINK %d %.1f\r\n" % (rssi, snr)).encode()
     for c in clients[:]:
         try:
             c.send(payload)
@@ -197,14 +232,6 @@ while True:
     accept_new()
     check_pending()
 
-    # -------- diagnosa CRC --------
-    try:
-        if lora._r(0x12) & 0x20:
-            crc_err += 1
-            print("[LoRa] CRC error #%d rssi=%d" % (crc_err, lora.rssi_now()))
-    except Exception:
-        pass
-
     # -------- poll LoRa --------
     try:
         data = lora.poll()
@@ -212,30 +239,39 @@ while True:
         print("[LoRa] poll error:", e)
         data = None
 
-    if data is not None:
-        try:
-            line = data.decode().strip()
-        except Exception:
-            print("! <non-utf8>")
-            line = None
+    if lora.crc_errors != last_crc:
+        last_crc = lora.crc_errors
+        print("[LoRa] CRC error #%d rssi=%d" % (last_crc, lora.rssi_now()))
 
-        if line is not None and valid_packet(line):
+    if data is not None:
+        line = decode_packet(data)
+        if line is not None:
             rx_count += 1
             print("[LoRa] RX #%d: %s" % (rx_count, line))
             if SHOW_RSSI:
                 print("        # rssi=%d snr=%.1f" % (lora.rssi, lora.snr))
             if clients:
-                forward(line)
+                forward(line, lora.rssi, lora.snr)
             else:
                 print("[TCP] Tidak ada GCS - paket tidak diteruskan")
-        elif line is not None:
+        else:
             bad_count += 1
-            print("! Paket rusak / checksum salah:", line)
+            print("! Paket asing / panjang salah (%d byte), total %d" % (len(data), bad_count))
 
     # -------- status --------
     if not clients and time.time() - last_status > 5:
         last_status = time.time()
         print("[status] WiFi OK, menunggu GCS...")
+
+    # -------- WiFi putus -> sambung lagi --------
+    if time.time() - last_wifi > 5:
+        last_wifi = time.time()
+        try:
+            if not wlan.isconnected():
+                print("[WiFi] putus, reconnect...")
+                wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+        except Exception as e:
+            print("[WiFi] reconnect error:", e)
 
     # -------- watchdog radio (tiap 2 detik) --------
     if time.ticks_diff(time.ticks_ms(), _dbg) > 2000:
